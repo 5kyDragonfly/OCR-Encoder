@@ -17,7 +17,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Iterable, List, Tuple
-
+import math
 import cv2
 import numpy as np
 from PIL import Image
@@ -28,6 +28,40 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+
+
+def assess_quality(gray: np.ndarray) -> dict:
+    # basic metrics that predict OCR-readiness
+    blur = cv2.Laplacian(gray, cv2.CV_64F).var()     # sharpness
+    contrast = float(gray.std())                     # global contrast
+    # entropy (no skimage needed)
+    hist = cv2.calcHist([gray],[0],None,[256],[0,256]).ravel()
+    hist /= max(hist.sum(), 1.0)
+    entropy = float(-np.sum(hist[hist>0]*np.log2(hist[hist>0])))
+    return {"blur": blur, "contrast": contrast, "entropy": entropy}
+
+def enhance_gray_binary(gray: np.ndarray, strong: bool = False) -> np.ndarray:
+    # your existing binary pipeline with tiny tweaks
+    h_val = 15 if not strong else 25
+    den = cv2.fastNlMeansDenoising(gray, h=h_val, templateWindowSize=7, searchWindowSize=21)
+    clahe = cv2.createCLAHE(clipLimit=(4.0 if strong else 3.0), tileGridSize=(8,8))
+    eq = clahe.apply(den)
+    # gentler unsharp
+    blur = cv2.GaussianBlur(eq, (0,0), sigmaX=1.0)
+    sharp = cv2.addWeighted(eq, 1.25, blur, -0.25, 0)
+    # choose threshold: Otsu works better on clean docs
+    _, th = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # light morphology only
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+    opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, kern, iterations=1)
+    return opened
+
+def enhance_gray_mild(gray: np.ndarray) -> np.ndarray:
+    # for already good images: keep grayscale, mild unsharp
+    blur = cv2.GaussianBlur(gray, (0,0), 0.8)
+    mild = cv2.addWeighted(gray, 1.15, blur, -0.15, 0)
+    return mild
 
 def read_image_bgr(path: Path) -> np.ndarray:
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -89,11 +123,21 @@ def enhance_gray(gray: np.ndarray, strong: bool = False) -> np.ndarray:
 
     return closed
 
-def enhance_file(path: Path, strong: bool = False) -> np.ndarray:
+def enhance_file(path: Path, strong: bool = False, mode: str = "auto") -> np.ndarray:
     bgr = read_image_bgr(path)
     gray = to_gray(bgr)
     gray = auto_scale(gray)
-    return enhance_gray(gray, strong=strong)
+
+    if mode == "gray":
+        return enhance_gray_mild(gray)
+    if mode == "binary":
+        return enhance_gray_binary(gray, strong=strong)
+
+    # AUTO: decide based on metrics
+    q = assess_quality(gray)
+    # thresholds tuned for receipts; adjust if needed
+    already_good = (q["blur"] > 800 and q["contrast"] > 60 and q["entropy"] > 5.0)
+    return enhance_gray_mild(gray) if already_good else enhance_gray_binary(gray, strong=strong)
 
 def iter_inputs(files_and_dirs: Iterable[str]) -> List[Path]:
     out: List[Path] = []
