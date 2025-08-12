@@ -1,13 +1,21 @@
-# ui.py – Streamlit front-end that chains to enhancer.py
+# ui.py – Streamlit front-end that chains to enhancer and GCV in-process
 
 import streamlit as st
 import os
-import sys
 import shutil
 import tempfile
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, Tk
+
+# extra deps for in-process pipeline
+import cv2
+
+# lazy imports so the UI still loads if files are missing
+def _lazy_imports():
+    from enhancer import enhance_file          # returns np.ndarray
+    from gcv_engine import run_files as gcv_run_files  # runs OCR on file paths
+    return enhance_file, gcv_run_files
 
 # --------------------------------------------------
 # Page config
@@ -35,56 +43,16 @@ def pick_directory() -> str | None:
     except Exception:
         return None
 
-def run_pipeline(file_paths: list[Path],
-                 save_debug: bool,
-                 debug_dir: Path,
-                 strong: bool,
-                 run_ocr: bool,
-                 jsonl_name: str,
-                 parser_cmd: str,
-                 keep_temp: bool) -> tuple[int, Path | None, Path, Path]:
-    """
-    Returns (exit_code, jsonl_path or None, debug_dir, log_path)
-    """
-    # Build a temp working folder and list file
-    tmp_root = Path(tempfile.mkdtemp(prefix="ui_paths_"))
-    lst = tmp_root / "paths.txt"
-    lst.write_text("\n".join(str(p) for p in file_paths), encoding="utf-8")
-
-    # Resolve enhancer script and output targets
-    enhancer_py = str((Path(__file__).parent / "enhancer.py").resolve())
-    downloads = get_downloads_folder()
-    jsonl_path = (downloads / jsonl_name).resolve() if run_ocr and jsonl_name else None
-
-    if save_debug:
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
-    # Compose command for enhancer.py
-    parts = [
-        f'"{sys.executable}"',
-        f'"{enhancer_py}"',
-        f'--list "{lst}"',
-    ]
-    parts.append(f'--debug-dir "{debug_dir}"' if save_debug else "--no-debug")
-    if strong:
-        parts.append("--strong")
-    if run_ocr:
-        parts.append("--chain-gcv")
-        if jsonl_path:
-            parts.append(f'--gcv-out "{jsonl_path}"')
-        if parser_cmd.strip():
-            parts.append(f'--pipe-parser "{parser_cmd.strip()}"')
-    if keep_temp:
-        parts.append("--keep-temp")
-
-    cmd = " ".join(parts)
-
-    # Capture logs to a file so we can show them in the UI
-    log_path = tmp_root / "run.log"
-    cmd_with_redirect = f'{cmd} > "{log_path}" 2>&1'
-    rc = os.system(cmd_with_redirect)
-
-    return rc, jsonl_path, debug_dir, log_path
+# --------------------------------------------------
+# Sidebar controls
+# --------------------------------------------------
+st.sidebar.header("Run options")
+run_ocr   = st.sidebar.checkbox("Run OCR after enhance", value=True)
+strong    = st.sidebar.checkbox("Use strong enhance", value=False)
+save_dbg  = st.sidebar.checkbox("Save enhanced copies for debugging", value=True)
+dbg_dir_s = st.sidebar.text_input("Debug folder", value="images_enhanced_debug")
+jsonl_nm  = st.sidebar.text_input("JSONL filename in Downloads", value="receipts.jsonl")
+keep_temp = st.sidebar.checkbox("Keep temp enhanced files", value=False)
 
 # --------------------------------------------------
 # Session-state init
@@ -97,18 +65,6 @@ DEFAULTS = {
 }
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
-
-# --------------------------------------------------
-# Sidebar controls
-# --------------------------------------------------
-st.sidebar.header("Run options")
-run_ocr = st.sidebar.checkbox("Run OCR after enhance", value=True)
-strong = st.sidebar.checkbox("Use strong enhance", value=False)
-save_debug = st.sidebar.checkbox("Save enhanced copies for debugging", value=True)
-debug_dir_input = st.sidebar.text_input("Debug folder", value="images_enhanced_debug")
-parser_cmd = st.sidebar.text_input("Pipe GCV output to command", value="", placeholder="python parser.py")
-jsonl_name = st.sidebar.text_input("JSONL filename in Downloads", value="receipts.jsonl")
-keep_temp = st.sidebar.checkbox("Keep temp enhanced files", value=False)
 
 # --------------------------------------------------
 # Upload controls
@@ -173,45 +129,85 @@ with col_btn:
     run_clicked = st.button(
         "⚙️  Enhance → OCR" if run_ocr else "⚙️  Enhance only",
         disabled=not st.session_state.images,
-        help="Runs enhancer.py then optionally gcv_engine.py"
+        help="Enhances in memory, saves debug copies, then runs GCV"
     )
 
+# --------------------------------------------------
+# Pipeline
+# --------------------------------------------------
 if run_clicked:
-    paths = [p.resolve() for p in st.session_state.images.values()]
-    debug_dir = Path(debug_dir_input).resolve()
-
-    with st.spinner("Running enhancer"):
-        rc, jsonl_path, dbg_dir, log_path = run_pipeline(
-            file_paths=paths,
-            save_debug=save_debug,
-            debug_dir=debug_dir,
-            strong=strong,
-            run_ocr=run_ocr,
-            jsonl_name=jsonl_name.strip() or "receipts.jsonl",
-            parser_cmd=parser_cmd,
-            keep_temp=keep_temp,
-        )
-
-    # Logs
+    logs = []
     try:
-        log_text = Path(log_path).read_text(encoding="utf-8")
-    except Exception:
-        log_text = "(no logs found)"
+        enhance_file, gcv_run_files = _lazy_imports()
+    except Exception as e:
+        st.error(f"Could not import enhancer or gcv_engine. {e}")
+        st.stop()
 
+    src_paths = [p.resolve() for p in st.session_state.images.values()]
+    dbg_dir   = Path(dbg_dir_s).resolve()
+    if save_dbg:
+        dbg_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="ui_enhanced_"))
+    tmp_enh  = tmp_root / "images_enhanced"
+    tmp_enh.mkdir(parents=True, exist_ok=True)
+
+    progress = st.progress(0.0, text="Enhancing… 0 / 0")
+    enhanced_paths: list[Path] = []
+
+    # enhance files
+    total = len(src_paths)
+    for i, p in enumerate(src_paths, 1):
+        try:
+            img = enhance_file(p, strong=strong)
+            out_name = p.with_suffix(".png").name
+            tmp_out = tmp_enh / out_name
+            cv2.imwrite(str(tmp_out), img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            enhanced_paths.append(tmp_out)
+
+            if save_dbg:
+                dbg_out = dbg_dir / out_name
+                cv2.imwrite(str(dbg_out), img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+
+            logs.append(f"[enhance] {i}/{total} -> {out_name}")
+        except Exception as ex:
+            logs.append(f"[error] enhance failed for {p.name} {ex}")
+
+        progress.progress(i / total, text=f"Enhancing… {i} / {total}")
+
+    progress.empty()
+
+    # run OCR
+    jsonl_path = None
+    if run_ocr and enhanced_paths:
+        jsonl_path = get_downloads_folder() / (jsonl_nm.strip() or "receipts.jsonl")
+        try:
+            rc = gcv_run_files([str(p) for p in enhanced_paths], out_path=str(jsonl_path))
+            if rc == 0:
+                logs.append(f"[gcv] wrote {jsonl_path}")
+            else:
+                logs.append(f"[gcv] exited with code {rc}")
+        except Exception as ex:
+            logs.append(f"[error] gcv_engine failed {ex}")
+
+    # cleanup
+    if not keep_temp:
+        try:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        except Exception:
+            pass
+
+    # show logs and results
     st.write("### Run logs")
-    st.code(log_text, language="bash")
+    st.code("\n".join(logs) if logs else "(no logs)", language="bash")
 
-    # Results
-    if rc == 0:
-        if save_debug:
-            st.success(f"Enhanced copies saved to {dbg_dir}")
-        if run_ocr and jsonl_path:
-            st.success(f"OCR JSONL saved to {jsonl_path}")
-            st.toast("✅ OCR output written", icon="🗂️")
-        else:
-            st.toast("✅ Enhancement done", icon="✨")
+    if save_dbg:
+        st.success(f"Enhanced copies saved to {dbg_dir}")
+    if run_ocr and jsonl_path and jsonl_path.exists():
+        st.success(f"OCR JSONL saved to {jsonl_path}")
+        st.toast("✅ OCR output written", icon="🗂️")
     else:
-        st.error(f"Pipeline exited with code {rc}")
+        st.toast("✅ Enhancement done", icon="✨")
 
 # --------------------------------------------------
 # Preview grid
@@ -231,14 +227,12 @@ if st.session_state.images:
 # --------------------------------------------------
 # Optional preview of enhanced images
 # --------------------------------------------------
-if save_debug and Path(debug_dir_input).exists():
-    enhanced = sorted(
-        [p for p in Path(debug_dir_input).glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"}]
-    )
+if save_dbg and Path(dbg_dir_s).exists():
+    enhanced = sorted([p for p in Path(dbg_dir_s).glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
     if enhanced:
         st.write("### Enhanced previews")
         cols_per_row = 4
-        for idx, p in enumerate(enhanced[:24]):  # show up to 24
+        for idx, p in enumerate(enhanced[:24]):
             if idx % cols_per_row == 0:
                 cols = st.columns(cols_per_row)
             with cols[idx % cols_per_row]:
