@@ -110,12 +110,7 @@ def _jsonl_write(stream, obj: Dict[str, Any]) -> None:
     stream.write(json.dumps(obj, ensure_ascii=False) + "\n")
     stream.flush()
 
-def run_files(file_paths: List[str], out_path: str | None = None) -> int:
-    """
-    Programmatic API. Pass exact file paths from your UI.
-    Writes JSONL to a file if out_path is set. Otherwise writes to stdout.
-    Returns 0 on success and nonzero on failure.
-    """
+def run_files(file_paths: List[str], out_path: str | None = None, minimal: bool = False) -> int:
     tmp_cred = _load_credentials_from_env()
     files = _iter_files(file_paths)
     if not files:
@@ -138,20 +133,31 @@ def run_files(file_paths: List[str], out_path: str | None = None) -> int:
                 print(f"[warn] ocr failed {p.name} {e}", file=sys.stderr)
                 continue
 
-            rec = {
-                "id": _sha1(b),
-                "filename": p.name,
-                "source_path": str(p),
-                "text": ocr["text"],
-                "locale": ocr.get("locale"),
-                "engine": ocr["engine"],
-            }
+            # normalize text: strip leading/trailing whitespace, keep internal newlines
+            txt = (ocr["text"] or "").strip()
+
+            if minimal:
+                rec = {
+                    "text": txt,
+                    # include locale if present; omit if None to keep it minimal
+                    **({"locale": ocr.get("locale")} if ocr.get("locale") else {})
+                }
+            else:
+                # existing verbose record (kept for backward-compat)
+                rec = {
+                    "id": _sha1(b),
+                    "filename": p.name,
+                    "source_path": str(p),
+                    "text": txt,
+                    "locale": ocr.get("locale"),
+                    "engine": ocr["engine"],
+                }
+
             _jsonl_write(out_stream, rec)
             print(f"[info] {i}/{len(files)} {p.name}", file=sys.stderr)
     finally:
         if close_stream:
             out_stream.close()
-        # Clean temp credentials if we created them
         if tmp_cred:
             try:
                 Path(tmp_cred).unlink(missing_ok=True)
@@ -164,6 +170,8 @@ def main() -> None:
     parser.add_argument("--files", nargs="*", help="image files and or directories", default=[])
     parser.add_argument("--list", help="path to a text file with one image path per line")
     parser.add_argument("--out", help="output JSONL file. omit to write to stdout")
+    parser.add_argument("--minimal", action="store_true",
+                        help="emit minimal JSONL with only {'text', 'locale?'}")
     args = parser.parse_args()
 
     files: List[str] = []
@@ -176,7 +184,7 @@ def main() -> None:
             sys.exit(2)
     files.extend(args.files or [])
 
-    rc = run_files(files, out_path=args.out)
+    rc = run_files(files, out_path=args.out, minimal=args.minimal)
     sys.exit(rc)
 
 if __name__ == "__main__":

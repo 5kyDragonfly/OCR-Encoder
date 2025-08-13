@@ -127,7 +127,7 @@ if uploaded_files is not None:
 # --------------------------------------------------
 with col_btn:
     run_clicked = st.button(
-        "⚙️  Enhance → OCR" if run_ocr else "⚙️  Enhance only",
+        "⚙️ SCAN FILES" if run_ocr else "⚙️  Enhance only",
         disabled=not st.session_state.images,
         help="Enhances in memory, saves debug copies, then runs GCV"
     )
